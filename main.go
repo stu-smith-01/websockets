@@ -1,9 +1,17 @@
 package main
 
-import "net/http"
+import (
+	"bytes"
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
 
 type Client struct {
 	broker *Broker
+	conn   *websocket.Conn
 	send   chan []byte
 }
 type Broker struct {
@@ -17,8 +25,12 @@ type Broker struct {
 	register chan *Client
 }
 
-func NewClient() *Client {
-	return &Client{}
+func NewClient(broker *Broker, conn *websocket.Conn, send chan []byte) *Client {
+	return &Client{
+		broker: broker,
+		send:   send,
+		conn:   conn,
+	}
 }
 
 func NewBroker() *Broker {
@@ -30,7 +42,6 @@ func NewBroker() *Broker {
 }
 
 func (b *Broker) run() {
-
 	for {
 		select {
 		case client := <-b.register:
@@ -51,17 +62,121 @@ func (b *Broker) run() {
 }
 
 func main() {
+	// Initialise a broker.
 	broker := NewBroker()
 	go broker.run()
 
-	http.HandleFunc("/", serveHome)
+	go http.HandleFunc("/", serveHome)
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		serveWs(broker, w, r)
 	})
-	http.ListenAndServe("1111", nil)
+	log.Fatal(http.ListenAndServe(":1111", nil))
 }
 
-func serveWs(broker *Broker, w http.ResponseWriter, r *http.Request) {}
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+}
+
+func serveWs(broker *Broker, w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	client := NewClient(broker, conn, make(chan []byte))
+	client.broker.register <- client
+	go client.writePump()
+	go client.readPump()
+
+}
 func serveHome(w http.ResponseWriter, r *http.Request) {
+	log.Println(r.URL)
+	if r.URL.Path != "/" {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	http.ServeFile(w, r, "home.html")
+}
+
+const (
+	// Time allowed to write a message to the peer.
+	writeWait = 10 * time.Second
+
+	// Time allowed to read the next pong message from the peer.
+	pongWait = 60 * time.Second
+
+	// Send pings to peer with this period. Must be less than pongWait.
+	pingPeriod = (pongWait * 9) / 10
+
+	// Maximum message size allowed from peer.
+	maxMessageSize = 512
+)
+
+func (c *Client) writePump() {
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
+	for {
+		select {
+		case message, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				// The broker closed the channel.
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+
+			w, err := c.conn.NextWriter(websocket.TextMessage)
+			if err != nil {
+				return
+			}
+			w.Write(message)
+
+			// Add queued chat messages to the current websocket message.
+			n := len(c.send)
+			for i := 0; i < n; i++ {
+				// w.Write(newline)
+				w.Write(<-c.send)
+			}
+
+			if err := w.Close(); err != nil {
+				return
+			}
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+var (
+	newline = []byte{'\n'}
+	space   = []byte{' '}
+)
+
+func (c *Client) readPump() {
+	c.conn.SetReadLimit(maxMessageSize)
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error { c.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
+	for {
+		_, message, err := c.conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("error: %v", err)
+			}
+			break
+		}
+		message = bytes.TrimSpace(bytes.Replace(message, newline, space, -1))
+		c.broker.broadcast <- message
+	}
 }
